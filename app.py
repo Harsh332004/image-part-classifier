@@ -1,43 +1,73 @@
-# app.py
-import os
-os.environ["STREAMLIT_WATCHED_FILES"] = ""
+"""Streamlit web app for the machine-part classifier."""
+import json
+
+import pandas as pd
 import streamlit as st
-import numpy as np
-import cv2
-import joblib
-from tensorflow.keras.applications import EfficientNetB0
-from tensorflow.keras.applications.efficientnet import preprocess_input
-from tensorflow.keras.models import Model
 
-# Load EfficientNet model (without top layer for feature extraction)
-base_model = EfficientNetB0(include_top=False, pooling='avg', weights='imagenet')
-feature_model = Model(inputs=base_model.input, outputs=base_model.output)
+from common import METRICS_PATH, load_artifacts, load_rgb, predict_proba
 
-# Load trained classifier and labels
-rf_model, class_names = joblib.load("rf_parts_classifier.pkl")
+st.set_page_config(page_title="Machine Part Classifier", page_icon="🔩")
 
-# UI
-st.title(" Machine Part Classifier (EfficientNet + RF)")
-st.write("Upload a machine part image (bolt, nut, washer, locatingpin.)")
 
-uploaded_file = st.file_uploader("Choose an image", type=["jpg", "jpeg", "png"])
+@st.cache_resource(show_spinner="Loading model...")
+def get_model():
+    return load_artifacts()          # loaded once, not on every rerun
 
-if uploaded_file is not None:
-    file_bytes = np.asarray(bytearray(uploaded_file.read()), dtype=np.uint8)
-    img = cv2.imdecode(file_bytes, cv2.IMREAD_COLOR)
-    st.image(img, caption="Uploaded Image", use_column_width=True)
 
-    # Resize and preprocess for EfficientNet
-    img_resized = cv2.resize(img, (224, 224))
-    img_array = np.expand_dims(img_resized.astype(np.float32), axis=0)
-    img_array = preprocess_input(img_array)
+st.title("🔩 Machine Part Classifier")
 
-    # Extract features using EfficientNet
-    features = feature_model.predict(img_array)
-    features_flat = features.reshape(1, -1)  # shape (1, 1280)
+try:
+    model, class_names = get_model()
+except FileNotFoundError as err:
+    st.error(str(err))
+    st.stop()
 
-    # Predict using RandomForest
-    prediction = rf_model.predict(features_flat)[0]
-    predicted_label = class_names[prediction]
+st.write(f"Upload a photo of a part. Supported classes: **{', '.join(class_names)}**.")
 
-    st.success(f" Predicted Part: **{predicted_label}**")
+with st.sidebar:
+    st.header("Settings")
+    threshold = st.slider("Minimum confidence", 0.30, 0.95, 0.60, 0.05,
+                          help="Below this the app says 'uncertain' instead of guessing.")
+    use_tta = st.checkbox("Test-time augmentation", value=True,
+                          help="Averages predictions over flipped copies (slower, steadier).")
+    if METRICS_PATH.exists():
+        m = json.loads(METRICS_PATH.read_text(encoding="utf-8"))
+        st.header("Model quality")
+        st.metric("Test accuracy", f"{m['test_accuracy']:.1%}")
+        st.metric("Macro F1", f"{m['macro_f1']:.3f}")
+        st.caption(f"Measured on {m['n_test']} images never used in training.")
+
+tab_upload, tab_camera = st.tabs(["Upload", "Camera"])
+with tab_upload:
+    source = st.file_uploader("Choose an image", type=["jpg", "jpeg", "png", "webp", "bmp"])
+with tab_camera:
+    camera = st.camera_input("Take a photo")
+source = source or camera
+
+if source is not None:
+    try:
+        image = load_rgb(source)
+    except Exception:
+        st.error("Could not read this file as an image.")
+        st.stop()
+
+    st.image(image, caption="Input image", use_container_width=True)
+
+    with st.spinner("Classifying..."):
+        probs = predict_proba(model, image, tta=use_tta)
+
+    order = probs.argsort()[::-1]
+    best = int(order[0])
+    confidence = float(probs[best])
+
+    if confidence >= threshold:
+        st.success(f"Predicted part: **{class_names[best]}** ({confidence:.1%})")
+    else:
+        st.warning(
+            f"Uncertain - best guess is **{class_names[best]}** ({confidence:.1%}), "
+            "below the confidence threshold. This may not be one of the supported "
+            "parts, or the photo may be unclear."
+        )
+
+    st.subheader("Class probabilities")
+    st.bar_chart(pd.Series({class_names[i]: float(probs[i]) for i in order}))
